@@ -444,8 +444,10 @@ public:
   using ResponseOrProtocolError = kj::OneOf<Response, ProtocolError>;
   using RequestConnectOrProtocolError = kj::OneOf<Request, ConnectRequest, ProtocolError>;
 
-  RequestOrProtocolError tryParseRequest(kj::ArrayPtr<char> content);
-  RequestConnectOrProtocolError tryParseRequestOrConnect(kj::ArrayPtr<char> content);
+  RequestOrProtocolError tryParseRequest(kj::ArrayPtr<char> content,
+                                         bool allowOtherMethods = false);
+  RequestConnectOrProtocolError tryParseRequestOrConnect(kj::ArrayPtr<char> content,
+                                                         bool allowOtherMethods = false);
   ResponseOrProtocolError tryParseResponse(kj::ArrayPtr<char> content);
 
   // Parse an HTTP header blob and add all the headers to this object.
@@ -456,6 +458,10 @@ public:
   // The parse is performed with zero copies: The callee clobbers `content` with '\0' characters
   // to split it into a bunch of shorter strings. The caller must keep `content` valid until the
   // `HttpHeaders` is destroyed, or pass it to `takeOwnership()`.
+  //
+  // By default, a request whose method isn't listed in KJ_HTTP_FOR_EACH_METHOD is a protocol error
+  // (501 Not Implemented). If `allowOtherMethods` is true, any valid method (see
+  // isValidHttpMethod()) is parsed instead.
 
   bool tryParse(kj::ArrayPtr<char> content);
   // Like tryParseRequest()/tryParseResponse(), but don't expect any request/response line.
@@ -1033,7 +1039,8 @@ public:
   // Perform an HTTP request.
   //
   // `method` is a valid method (see isValidHttpMethod()), but not necessarily one listed in
-  // KJ_HTTP_FOR_EACH_METHOD.
+  // KJ_HTTP_FOR_EACH_METHOD. (HttpServer passes such a method only if
+  // HttpServerSettings::allowOtherMethods is set.)
   //
   // `url` may be a full URL (with protocol and host) or it may be only the path part of the URL,
   // depending on whether the service is a proxy service or a host service.
@@ -1305,6 +1312,13 @@ struct HttpServerSettings {
     AUTOMATIC_COMPRESSION, // Will perform compression parameter negotiation if client requests it.
   };
   WebSocketCompressionMode webSocketCompressionMode = NO_COMPRESSION;
+
+  bool allowOtherMethods = false;
+  // If false, the server replies 501 Not Implemented to a request whose method isn't listed in
+  // KJ_HTTP_FOR_EACH_METHOD, without calling the HttpService. If true, any valid method (see
+  // isValidHttpMethod()) is passed to the HttpService. Such requests are framed like any other
+  // request: the body is delimited by Content-Length or Transfer-Encoding, and the response has a
+  // body.
 };
 
 class HttpServerErrorHandler {

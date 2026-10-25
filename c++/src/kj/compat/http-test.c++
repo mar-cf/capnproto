@@ -359,10 +359,21 @@ KJ_TEST("HttpHeaders parse invalid") {
 KJ_TEST("HttpHeaders parse requests with methods not in KJ_HTTP_FOR_EACH_METHOD") {
   auto table = HttpHeaderTable::Builder().build();
 
+  // Rejected by default.
   {
     HttpHeaders headers(*table);
     auto input = kj::heapString("BLOCK /foo HTTP/1.1\r\nHost: example.com\r\n\r\n");
-    auto request = headers.tryParseRequest(input).get<HttpHeaders::Request>();
+    auto protocolError = headers.tryParseRequest(input).get<HttpHeaders::ProtocolError>();
+    KJ_EXPECT(protocolError.statusCode == 501);
+    KJ_EXPECT(protocolError.description == "Unrecognized request method.",
+        protocolError.description);
+  }
+
+  // Accepted when allowed.
+  {
+    HttpHeaders headers(*table);
+    auto input = kj::heapString("BLOCK /foo HTTP/1.1\r\nHost: example.com\r\n\r\n");
+    auto request = headers.tryParseRequest(input, true).get<HttpHeaders::Request>();
     KJ_EXPECT(request.method == "BLOCK");
     KJ_EXPECT(request.url == "/foo");
     KJ_EXPECT(KJ_ASSERT_NONNULL(headers.get(HttpHeaderId::HOST)) == "example.com");
@@ -379,7 +390,7 @@ KJ_TEST("HttpHeaders parse requests with methods not in KJ_HTTP_FOR_EACH_METHOD"
   {
     HttpHeaders headers(*table);
     auto input = kj::heapString("GETX /foo HTTP/1.1\r\n\r\n");
-    auto request = headers.tryParseRequest(input).get<HttpHeaders::Request>();
+    auto request = headers.tryParseRequest(input, true).get<HttpHeaders::Request>();
     KJ_EXPECT(request.method == "GETX");
   }
 
@@ -388,7 +399,7 @@ KJ_TEST("HttpHeaders parse requests with methods not in KJ_HTTP_FOR_EACH_METHOD"
     auto name = kj::str(kj::repeat('X', 1000));
     HttpHeaders headers(*table);
     auto input = kj::heapString(kj::str(name, " /foo HTTP/1.1\r\n\r\n"));
-    auto request = headers.tryParseRequest(input).get<HttpHeaders::Request>();
+    auto request = headers.tryParseRequest(input, true).get<HttpHeaders::Request>();
     KJ_EXPECT(request.method == name);
   }
 
@@ -396,7 +407,8 @@ KJ_TEST("HttpHeaders parse requests with methods not in KJ_HTTP_FOR_EACH_METHOD"
   {
     HttpHeaders headers(*table);
     auto input = kj::heapString("CONNECT example.com:443 HTTP/1.1\r\n\r\n");
-    auto request = headers.tryParseRequestOrConnect(input).get<HttpHeaders::ConnectRequest>();
+    auto request = headers.tryParseRequestOrConnect(input, true)
+        .get<HttpHeaders::ConnectRequest>();
     KJ_EXPECT(request.authority == "example.com:443");
   }
 
@@ -407,7 +419,7 @@ KJ_TEST("HttpHeaders parse requests with methods not in KJ_HTTP_FOR_EACH_METHOD"
     KJ_CONTEXT(text);
     HttpHeaders headers(*table);
     auto input = kj::heapString(text);
-    auto protocolError = headers.tryParseRequest(input).get<HttpHeaders::ProtocolError>();
+    auto protocolError = headers.tryParseRequest(input, true).get<HttpHeaders::ProtocolError>();
     KJ_EXPECT(protocolError.statusCode == 501);
   }
 }
@@ -1769,12 +1781,14 @@ KJ_TEST("HttpClient and HttpServer handle methods not in KJ_HTTP_FOR_EACH_METHOD
     testHttpClientRequest(waitScope, testCase.request, KJ_HTTP_TEST_CREATE_2PIPE);
   }
 
-  // The server passes them to the service.
+  // The server passes them to the service when allowed.
   {
     auto pipe = KJ_HTTP_TEST_CREATE_2PIPE;
     HttpHeaderTable table;
     TestHttpService service(testCases, table);
-    HttpServer server(timer, table, service);
+    HttpServerSettings settings;
+    settings.allowOtherMethods = true;
+    HttpServer server(timer, table, service, settings);
 
     auto listenTask = server.listenHttp(kj::mv(pipe.ends[0]));
 
@@ -1788,6 +1802,29 @@ KJ_TEST("HttpClient and HttpServer handle methods not in KJ_HTTP_FOR_EACH_METHOD
     listenTask.wait(waitScope);
 
     KJ_EXPECT(service.getRequestCount() == kj::size(testCases));
+  }
+
+  // By default, the server rejects them without calling the service.
+  {
+    auto pipe = KJ_HTTP_TEST_CREATE_2PIPE;
+    HttpHeaderTable table;
+    TestHttpService service(testCases, table);
+    HttpServer server(timer, table, service);
+
+    auto listenTask = server.listenHttp(kj::mv(pipe.ends[0]));
+
+    pipe.ends[1]->write(testCases[0].request.raw.asBytes()).wait(waitScope);
+    expectRead(*pipe.ends[1],
+        "HTTP/1.1 501 Not Implemented\r\n"
+        "Connection: close\r\n"
+        "Content-Length: 35\r\n"
+        "Content-Type: text/plain\r\n"
+        "\r\n"
+        "ERROR: Unrecognized request method."_kj).wait(waitScope);
+
+    listenTask.wait(waitScope);
+
+    KJ_EXPECT(service.getRequestCount() == 0);
   }
 }
 
@@ -1829,7 +1866,9 @@ KJ_TEST("HttpServer keeps a request's method valid until the request ends") {
 
   HttpHeaderTable table;
   MethodRecordingService service(table);
-  HttpServer server(timer, table, service);
+  HttpServerSettings settings;
+  settings.allowOtherMethods = true;
+  HttpServer server(timer, table, service, settings);
   auto listenTask = server.listenHttp(kj::mv(pipe.ends[0]));
 
   pipe.ends[1]->write(
@@ -1927,7 +1966,9 @@ KJ_TEST("HttpServer gives a response body to every method but exactly HEAD") {
 
   HttpHeaderTable table;
   MethodRecordingService service(table, "foo"_kj);
-  HttpServer server(timer, table, service);
+  HttpServerSettings settings;
+  settings.allowOtherMethods = true;
+  HttpServer server(timer, table, service, settings);
   auto listenTask = server.listenHttp(kj::mv(pipe.ends[0]));
 
   pipe.ends[1]->write(
@@ -5856,7 +5897,9 @@ KJ_TEST("HttpServer can suspend and resume a request with a method not in KJ_HTT
 
   HangingHttpService service;
   SuspendAfter factory;
-  HttpServer server(timer, factory.getHeaderTable(), service);
+  HttpServerSettings settings;
+  settings.allowOtherMethods = true;
+  HttpServer server(timer, factory.getHeaderTable(), service, settings);
 
   kj::Maybe<HttpServer::SuspendedRequest> suspendedRequest;
 

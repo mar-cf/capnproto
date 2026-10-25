@@ -511,7 +511,9 @@ void runEndToEndTests(kj::Timer& timer, kj::HttpHeaderTable& headerTable,
   auto backHttp = kj::newHttpClient(timer, headerTable, oneConnectAddr);
   auto backCapnp = serverFactory.kjToCapnp(kj::newHttpService(*backHttp));
   auto frontCapnp = clientFactory.capnpToKj(backCapnp);
-  kj::HttpServer frontKj(timer, headerTable, *frontCapnp);
+  kj::HttpServerSettings frontSettings;
+  frontSettings.allowOtherMethods = true;
+  kj::HttpServer frontKj(timer, headerTable, *frontCapnp, frontSettings);
   auto listenTask = frontKj.listenHttp(kj::mv(clientPipe.ends[1]))
       .eagerlyEvaluate([](kj::Exception&& e) { KJ_LOG(ERROR, e); });
 

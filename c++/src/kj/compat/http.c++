@@ -473,10 +473,11 @@ void requireValidHttpMethod(kj::ArrayPtr<const char> name) {
   }
 }
 
-static kj::Maybe<kj::OneOf<kj::StringPtr, HttpConnectMethod>> consumeRequestMethod(char*& ptr) {
+static kj::Maybe<kj::OneOf<kj::StringPtr, HttpConnectMethod>> consumeRequestMethod(
+    char*& ptr, bool allowOtherMethods) {
   // Consumes the method at the start of a request line and the space or tab after it. `ptr` must be
   // NUL-terminated. A method listed in KJ_HTTP_FOR_EACH_METHOD becomes its constant. Any other valid
-  // method is NUL-terminated in place, like a word consumed by consumeWord().
+  // method is NUL-terminated in place, like a word consumed by consumeWord(), if allowed.
 
   char* end = ptr;
   while (HTTP_METHOD_CHARS.contains(*end)) ++end;
@@ -491,7 +492,7 @@ static kj::Maybe<kj::OneOf<kj::StringPtr, HttpConnectMethod>> consumeRequestMeth
   }
 
   auto name = kj::arrayPtr(ptr, end);
-  if (!isValidHttpMethod(name)) return kj::none;
+  if (!allowOtherMethods || !isValidHttpMethod(name)) return kj::none;
   *end = '\0';
   ptr = end + 1;
   return kj::Maybe<kj::OneOf<kj::StringPtr, HttpConnectMethod>>(
@@ -1049,8 +1050,9 @@ static char* trimHeaderEnding(kj::ArrayPtr<char> content) {
   return end;
 }
 
-HttpHeaders::RequestOrProtocolError HttpHeaders::tryParseRequest(kj::ArrayPtr<char> content) {
-  KJ_SWITCH_ONEOF(tryParseRequestOrConnect(content)) {
+HttpHeaders::RequestOrProtocolError HttpHeaders::tryParseRequest(
+    kj::ArrayPtr<char> content, bool allowOtherMethods) {
+  KJ_SWITCH_ONEOF(tryParseRequestOrConnect(content, allowOtherMethods)) {
     KJ_CASE_ONEOF(request, Request) {
       return kj::mv(request);
     }
@@ -1066,7 +1068,7 @@ HttpHeaders::RequestOrProtocolError HttpHeaders::tryParseRequest(kj::ArrayPtr<ch
 }
 
 HttpHeaders::RequestConnectOrProtocolError HttpHeaders::tryParseRequestOrConnect(
-    kj::ArrayPtr<char> content) {
+    kj::ArrayPtr<char> content, bool allowOtherMethods) {
   char* end = trimHeaderEnding(content);
   if (end == nullptr) {
     return ProtocolError { 400, "Bad Request",
@@ -1077,7 +1079,7 @@ HttpHeaders::RequestConnectOrProtocolError HttpHeaders::tryParseRequestOrConnect
 
   HttpHeaders::RequestConnectOrProtocolError result;
 
-  KJ_IF_SOME(method, consumeRequestMethod(ptr)) {
+  KJ_IF_SOME(method, consumeRequestMethod(ptr, allowOtherMethods)) {
     kj::Maybe<StringPtr> path;
     KJ_IF_SOME(p, consumeWord(ptr)) {
       path = p;
@@ -1543,6 +1545,11 @@ public:
     return !broken && pendingMessageCount == 0;
   }
 
+  void setAllowOtherMethods(bool allow) {
+    // See HttpServerSettings::allowOtherMethods.
+    allowOtherMethods = allow;
+  }
+
   bool canSuspend() {
     // We are at a suspendable point if we've parsed the headers, but haven't consumed anything
     // beyond that.
@@ -1745,7 +1752,7 @@ public:
       }
       KJ_CASE_ONEOF(text, kj::ArrayPtr<char>) {
         headers.clear();
-        co_return headers.tryParseRequestOrConnect(text);
+        co_return headers.tryParseRequestOrConnect(text, allowOtherMethods);
       }
     }
 
@@ -1881,6 +1888,9 @@ private:
 
   bool broken = false;
   // Becomes true if the caller failed to read the whole entity-body before closing the stream.
+
+  bool allowOtherMethods = false;
+  // See HttpServerSettings::allowOtherMethods.
 
   uint pendingMessageCount = 0;
   // Number of reads we have queued up.
@@ -7963,6 +7973,7 @@ public:
         httpOutput(stream),
         wantCleanDrain(wantCleanDrain) {
     ++server.connectionCount;
+    httpInput.setAllowOtherMethods(server.settings.allowOtherMethods);
   }
   ~Connection() noexcept(false) {
     if (--server.connectionCount == 0) {
