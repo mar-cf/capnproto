@@ -1426,6 +1426,41 @@ KJ_TEST("HttpClient response body tryReadSync") {
   KJ_EXPECT(KJ_ASSERT_NONNULL(response.body->tryReadSync(arrayPtr(buf), 1)) == 0);
 }
 
+KJ_TEST("HttpClient keeps watching for close after refusing a request") {
+  KJ_HTTP_TEST_SETUP_IO;
+
+  auto pipe = KJ_HTTP_TEST_CREATE_2PIPE;
+
+  HttpHeaderTable table;
+  auto client = newHttpClient(table, *pipe.ends[0]);
+
+  // Complete a request, after which the client watches the idle connection for close.
+  {
+    auto req = client->request(HttpMethod::GET, "/", HttpHeaders(table));
+    req.body = nullptr;
+
+    auto serverTask = expectRead(*pipe.ends[1], "GET / HTTP/1.1\r\n\r\n")
+        .then([&]() {
+      return pipe.ends[1]->write("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"_kjb);
+    });
+
+    auto response = req.response.wait(waitScope);
+    serverTask.wait(waitScope);
+    KJ_EXPECT(response.statusCode == 200);
+    KJ_EXPECT(response.body->readAllText().wait(waitScope) == "");
+  }
+
+  // A request refused before anything is sent leaves the connection idle and reusable...
+  KJ_EXPECT_THROW_MESSAGE("invalid request URL",
+      client->request(HttpMethod::GET, "/foo bar", HttpHeaders(table)));
+
+  // ...so the client must still notice when the server closes it.
+  pipe.ends[1]->shutdownWrite();
+  waitScope.poll();
+  KJ_EXPECT_THROW_MESSAGE("connection has been closed",
+      client->request(HttpMethod::GET, "/", HttpHeaders(table)));
+}
+
 KJ_TEST("HttpClient chunked body pump from fixed length stream") {
   class FixedBodyStream final: public kj::AsyncInputStream {
     Promise<size_t> tryRead(void* buffer, size_t minBytes, size_t maxBytes) override {
