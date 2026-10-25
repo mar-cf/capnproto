@@ -135,6 +135,9 @@ struct HttpRequest {
     unknown @3 :Void;   # e.g. due to transfer-encoding: chunked
     fixed @4 :UInt64;   # e.g. due to content-length
   }
+
+  methodName @5 :Text;
+  # The method's name, if `method` is `other`. Null otherwise.
 }
 
 struct HttpResponse {
@@ -150,10 +153,9 @@ struct HttpResponse {
 }
 
 enum HttpMethod {
-  # This enum aligns precisely with the kj::HttpMethod enum. However, the backwards-compat
-  # constraints of a public-facing C++ enum vs. an internal Cap'n Proto interface differ in
-  # several ways, which could possibly lead to divergence someday. For now, a unit test verifies
-  # that they match exactly; if that test ever fails, we'll have to figure out what to do about it.
+  # A method with an enumerant here is sent as that enumerant. Any other method, including methods
+  # added to KJ_HTTP_FOR_EACH_METHOD later, is sent as `other`, with its name in
+  # `HttpRequest.methodName`. So, this enum should not need to grow any further.
 
   get @0;
   head @1;
@@ -187,6 +189,10 @@ enum HttpMethod {
 
   query @26;
   ban @27;
+
+  other @28;
+  # A method not listed above; see `HttpRequest.methodName`. Peers that predate `other` will reject
+  # requests that use it as having an unknown method.
 }
 
 annotation commonText @0x857745131db6fc83(enumerant) :Text;

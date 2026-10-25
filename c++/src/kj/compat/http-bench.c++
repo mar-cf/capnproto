@@ -36,7 +36,7 @@ class OkService final : public HttpService {
 public:
   OkService(HttpHeaderTable &table) : responseHeaders(table) {}
 
-  kj::Promise<void> request(HttpMethod method, kj::StringPtr url,
+  kj::Promise<void> request(kj::StringPtr method, kj::StringPtr url,
                             const HttpHeaders &headers,
                             kj::AsyncInputStream &requestBody,
                             Response &response) override {

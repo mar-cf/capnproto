@@ -88,28 +88,39 @@ namespace kj {
   MACRO(BAN) \
   /* Non-standard method name requested by a Cloudflare customer. */
 
-enum class HttpMethod {
-  // Enum of known HTTP methods.
-  //
-  // We use an enum rather than a string to allow for faster parsing and switching and to reduce
-  // ambiguity.
+namespace HttpMethod {
+// An HTTP request method is represented as a `kj::StringPtr` holding its name exactly as it appears
+// on the wire, so any method can be represented. This namespace holds a constant for each method
+// listed in KJ_HTTP_FOR_EACH_METHOD, e.g. `HttpMethod::GET`. Method names are case-sensitive, and
+// methods are compared as strings, e.g. `method == HttpMethod::HEAD`.
 
-#define DECLARE_METHOD(id) id,
+#define DECLARE_METHOD(id) inline constexpr kj::StringPtr id = #id ""_kj;
 KJ_HTTP_FOR_EACH_METHOD(DECLARE_METHOD)
 #undef DECLARE_METHOD
-};
+
+}  // namespace HttpMethod
 
 struct HttpConnectMethod {};
-// CONNECT is handled specially and separately from the other HttpMethods.
+// CONNECT is handled specially and separately from the other HTTP methods.
 
-kj::StringPtr KJ_STRINGIFY(HttpMethod method);
 kj::StringPtr KJ_STRINGIFY(HttpConnectMethod method);
-kj::Maybe<HttpMethod> tryParseHttpMethod(kj::StringPtr name);
-kj::Maybe<kj::OneOf<HttpMethod, HttpConnectMethod>> tryParseHttpMethodAllowingConnect(
+kj::Maybe<kj::StringPtr> tryParseHttpMethod(kj::StringPtr name);
+// Returns the constant for `name` if it is listed in KJ_HTTP_FOR_EACH_METHOD, e.g.
+// `HttpMethod::GET` for "GET". See isValidHttpMethod() to accept any method.
+kj::Maybe<kj::OneOf<kj::StringPtr, HttpConnectMethod>> tryParseHttpMethodAllowingConnect(
     kj::StringPtr name);
 // Like tryParseHttpMethod but, as the name suggests, explicitly allows for the CONNECT
 // method. Added as a separate function instead of modifying tryParseHttpMethod to avoid
 // breaking API changes in existing uses of tryParseHttpMethod.
+
+bool isValidHttpMethod(kj::ArrayPtr<const char> name);
+// Whether `name` can be the method of an HTTP request: any token per RFC 9110, except "CONNECT",
+// which is handled separately (see HttpService::connect()). KJ checks every method it sends or
+// receives with this, so that a method can't break the request line, e.g. by containing a space.
+
+void requireValidHttpMethod(kj::ArrayPtr<const char> name);
+// Throws if `isValidHttpMethod(name)` is false. The name may come from a peer, so the exception
+// includes only a short, escaped excerpt of it.
 
 class HttpHeaderTable;
 
@@ -385,7 +396,9 @@ public:
   // when you've passed a dynamic value to set() or add() or parse*().
 
   struct Request {
-    HttpMethod method;
+    kj::StringPtr method;
+    // A constant from the HttpMethod namespace for a method listed in KJ_HTTP_FOR_EACH_METHOD;
+    // otherwise, like `url`, a pointer into the parsed content.
     kj::StringPtr url;
   };
   struct ConnectRequest {
@@ -447,7 +460,7 @@ public:
   bool tryParse(kj::ArrayPtr<char> content);
   // Like tryParseRequest()/tryParseResponse(), but don't expect any request/response line.
 
-  kj::String serializeRequest(HttpMethod method, kj::StringPtr url,
+  kj::String serializeRequest(kj::StringPtr method, kj::StringPtr url,
                               kj::ArrayPtr<const kj::StringPtr> connectionHeaders = nullptr) const;
   kj::String serializeConnectRequest(kj::StringPtr authority,
                               kj::ArrayPtr<const kj::StringPtr> connectionHeaders = nullptr) const;
@@ -548,7 +561,7 @@ class HttpInputStream {
 
 public:
   struct Request {
-    HttpMethod method;
+    kj::StringPtr method;
     kj::StringPtr url;
     const HttpHeaders& headers;
     kj::Own<kj::AsyncInputStream> body;
@@ -576,11 +589,11 @@ public:
     const HttpHeaders& headers;
     kj::Own<kj::AsyncInputStream> body;
   };
-  virtual kj::Promise<Response> readResponse(HttpMethod requestMethod) = 0;
+  virtual kj::Promise<Response> readResponse(kj::StringPtr requestMethod) = 0;
   // Reads one HTTP response from the input stream.
   //
   // You must provide the request method because responses to HEAD requests require special
-  // treatment.
+  // treatment. It need only remain valid until `readResponse()` returns.
   //
   // The returned struct contains pointers directly into a buffer that is invalidated on the next
   // message read.
@@ -867,14 +880,17 @@ public:
     // Promise for the eventual response.
   };
 
-  virtual Request request(HttpMethod method, kj::StringPtr url, const HttpHeaders& headers,
+  virtual Request request(kj::StringPtr method, kj::StringPtr url, const HttpHeaders& headers,
                           kj::Maybe<uint64_t> expectedBodySize = kj::none) = 0;
   // Perform an HTTP request.
+  //
+  // `method` must be a valid method (see isValidHttpMethod()); KJ's implementations throw
+  // otherwise. Use connect() for CONNECT.
   //
   // `url` may be a full URL (with protocol and host) or it may be only the path part of the URL,
   // depending on whether the client is a proxy client or a host client.
   //
-  // `url` and `headers` need only remain valid until `request()` returns (they can be
+  // `method`, `url` and `headers` need only remain valid until `request()` returns (they can be
   // stack-allocated).
   //
   // `expectedBodySize`, if provided, must be exactly the number of bytes that will be written to
@@ -1012,15 +1028,19 @@ public:
   };
 
   virtual kj::Promise<void> request(
-      HttpMethod method, kj::StringPtr url, const HttpHeaders& headers,
+      kj::StringPtr method, kj::StringPtr url, const HttpHeaders& headers,
       kj::AsyncInputStream& requestBody, Response& response) = 0;
   // Perform an HTTP request.
+  //
+  // `method` is a valid method (see isValidHttpMethod()), but not necessarily one listed in
+  // KJ_HTTP_FOR_EACH_METHOD.
   //
   // `url` may be a full URL (with protocol and host) or it may be only the path part of the URL,
   // depending on whether the service is a proxy service or a host service.
   //
-  // `url` and `headers` are invalidated on the first read from `requestBody` or when the returned
-  // promise resolves, whichever comes first.
+  // `method`, `url` and `headers` remain valid until the returned promise resolves. Copy whatever
+  // you need for longer. In HTTP/1, `url` and `headers` are invalidated sooner if you call
+  // `response.acceptWebSocket()`, because the WebSocket reuses the buffer they point into.
   //
   // Request processing can be canceled by dropping the returned promise. HttpServer may do so if
   // the client disconnects prematurely.
@@ -1397,7 +1417,7 @@ public:
     // Nothing, this is an opaque type.
 
   private:
-    SuspendedRequest(kj::Array<byte>, kj::ArrayPtr<byte>, kj::OneOf<HttpMethod, HttpConnectMethod>, kj::StringPtr, HttpHeaders);
+    SuspendedRequest(kj::Array<byte>, kj::ArrayPtr<byte>, kj::OneOf<kj::StringPtr, HttpConnectMethod>, kj::StringPtr, HttpHeaders);
 
     kj::Array<byte> buffer;
     // A buffer containing at least the request's method, URL, and headers, and possibly content
@@ -1407,10 +1427,11 @@ public:
     // Pointer to the end of the request headers. If this has a non-zero length, then our buffer
     // contains additional content, presumably the head of the request body.
 
-    kj::OneOf<HttpMethod, HttpConnectMethod> method;
+    kj::OneOf<kj::StringPtr, HttpConnectMethod> method;
     kj::StringPtr url;
     HttpHeaders headers;
-    // Parsed request front matter. `url` and `headers` both store pointers into `buffer`.
+    // Parsed request front matter. `url` and `headers` both store pointers into `buffer`, and so
+    // does `method` unless it is a constant from the HttpMethod namespace.
 
     friend class HttpServer;
   };
@@ -1471,12 +1492,12 @@ class HttpServer::SuspendableRequest {
   // Interface passed to the SuspendableHttpServiceFactory parameter of listenHttpCleanDrain().
 
 public:
-  kj::OneOf<HttpMethod,HttpConnectMethod> method;
+  kj::OneOf<kj::StringPtr, HttpConnectMethod> method;
   kj::StringPtr url;
   const HttpHeaders& headers;
   // Parsed request front matter, so the implementer can decide whether to suspend the request.
-  // `url` and `headers` remain valid until the HttpService returned by the factory is destroyed,
-  // unless the request is suspended.
+  // `method`, `url` and `headers` remain valid until the HttpService returned by the factory is
+  // destroyed, unless the request is suspended.
 
   SuspendedRequest suspend();
   // Signal to the HttpServer that the current request loop should be exited. Return a
@@ -1486,7 +1507,7 @@ public:
 
 private:
   explicit SuspendableRequest(
-      Connection& connection, kj::OneOf<HttpMethod, HttpConnectMethod> method, kj::StringPtr url, const HttpHeaders& headers)
+      Connection& connection, kj::OneOf<kj::StringPtr, HttpConnectMethod> method, kj::StringPtr url, const HttpHeaders& headers)
       : method(method), url(url), headers(headers), connection(connection) {}
   KJ_DISALLOW_COPY_AND_MOVE(SuspendableRequest);
 

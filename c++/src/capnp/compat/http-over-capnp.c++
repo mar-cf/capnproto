@@ -31,6 +31,54 @@ using kj::byte;
 
 // =======================================================================================
 
+static constexpr kj::StringPtr CAPNP_METHODS[] = {
+  // The methods that have an enumerant in capnp::HttpMethod, in its order. Any other method travels
+  // as OTHER plus its name, so this list stays the same even if KJ_HTTP_FOR_EACH_METHOD grows.
+  kj::HttpMethod::GET, kj::HttpMethod::HEAD, kj::HttpMethod::POST, kj::HttpMethod::PUT,
+  kj::HttpMethod::DELETE, kj::HttpMethod::PATCH, kj::HttpMethod::PURGE, kj::HttpMethod::OPTIONS,
+  kj::HttpMethod::TRACE, kj::HttpMethod::COPY, kj::HttpMethod::LOCK, kj::HttpMethod::MKCOL,
+  kj::HttpMethod::MOVE, kj::HttpMethod::PROPFIND, kj::HttpMethod::PROPPATCH,
+  kj::HttpMethod::SEARCH, kj::HttpMethod::UNLOCK, kj::HttpMethod::ACL, kj::HttpMethod::REPORT,
+  kj::HttpMethod::MKACTIVITY, kj::HttpMethod::CHECKOUT, kj::HttpMethod::MERGE,
+  kj::HttpMethod::MSEARCH, kj::HttpMethod::NOTIFY, kj::HttpMethod::SUBSCRIBE,
+  kj::HttpMethod::UNSUBSCRIBE, kj::HttpMethod::QUERY, kj::HttpMethod::BAN,
+};
+static_assert(kj::size(CAPNP_METHODS) == static_cast<uint>(capnp::HttpMethod::OTHER));
+
+capnp::HttpMethod httpMethodToCapnp(kj::StringPtr method) {
+  for (auto i: kj::indices(CAPNP_METHODS)) {
+    if (method == CAPNP_METHODS[i]) return static_cast<capnp::HttpMethod>(i);
+  }
+  return capnp::HttpMethod::OTHER;
+}
+
+kj::StringPtr httpMethodFromCapnp(capnp::HttpMethod method, capnp::Text::Reader methodName) {
+  if (method == capnp::HttpMethod::OTHER) {
+    kj::requireValidHttpMethod(methodName);
+    return methodName;
+  }
+  auto index = static_cast<uint>(method);
+  KJ_REQUIRE(index < kj::size(CAPNP_METHODS), "unknown method", method);
+  return CAPNP_METHODS[index];
+}
+
+void setHttpMethod(capnp::HttpRequest::Builder request, kj::StringPtr method) {
+  kj::requireValidHttpMethod(method);
+  auto capnpMethod = httpMethodToCapnp(method);
+  request.setMethod(capnpMethod);
+  if (capnpMethod == capnp::HttpMethod::OTHER) {
+    request.setMethodName(method);
+  } else if (request.hasMethodName()) {
+    request.disownMethodName();
+  }
+}
+
+kj::StringPtr getHttpMethod(capnp::HttpRequest::Reader request) {
+  return httpMethodFromCapnp(request.getMethod(), request.getMethodName());
+}
+
+// =======================================================================================
+
 class HttpOverCapnpFactory::CapnpToKjWebSocketAdapter final: public capnp::WebSocket::Server {
 public:
   CapnpToKjWebSocketAdapter(kj::WebSocket& webSocket,
@@ -550,12 +598,12 @@ public:
       : factory(factory), inner(kj::mv(inner)) {}
 
   kj::Promise<void> request(
-      kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
+      kj::StringPtr method, kj::StringPtr url, const kj::HttpHeaders& headers,
       kj::AsyncInputStream& requestBody, kj::HttpService::Response& kjResponse) override {
     auto rpcRequest = inner.requestRequest();
 
     auto metadata = rpcRequest.initRequest();
-    metadata.setMethod(static_cast<capnp::HttpMethod>(method));
+    setHttpMethod(metadata, method);
     metadata.setUrl(url);
     metadata.adoptHeaders(factory.headersToCapnp(
         headers, Orphanage::getForMessageContaining(metadata)));
@@ -766,7 +814,7 @@ public:
                           capnp::HttpRequest::Reader request,
                           capnp::HttpService::ClientRequestContext::Client clientContext)
       : factory(factory),
-        method(validateMethod(request.getMethod())),
+        method(getHttpMethod(request)),
         url(request.getUrl()),
         headers(factory.capnpToKj(request.getHeaders())),
         clientContext(kj::mv(clientContext)) {}
@@ -833,16 +881,12 @@ public:
   }
 
   HttpOverCapnpFactory& factory;
-  kj::HttpMethod method;
+  kj::StringPtr method;
   kj::StringPtr url;
+  // Like `url`, `method` may point into the request message, which outlives this object.
   kj::HttpHeaders headers;
   capnp::HttpService::ClientRequestContext::Client clientContext;
   bool responseSent = false;
-
-  static kj::HttpMethod validateMethod(capnp::HttpMethod method) {
-    KJ_REQUIRE(method <= capnp::HttpMethod::BAN, "unknown method", method);
-    return static_cast<kj::HttpMethod>(method);
-  }
 
   template <typename T>
   void dontWaitForRpc(kj::Promise<T> promise) {

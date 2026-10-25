@@ -82,13 +82,76 @@ KJ_TEST("HttpOverCapnpFactory::capnpToKj rejects out of range common values") {
   }
 }
 
-KJ_TEST("KJ and RPC HTTP method enums match") {
-#define EXPECT_MATCH(METHOD) \
-  KJ_EXPECT(static_cast<uint>(kj::HttpMethod::METHOD) == \
-            static_cast<uint>(capnp::HttpMethod::METHOD));
+KJ_TEST("HTTP method conversion") {
+  // The methods the capnp enum has, not KJ_HTTP_FOR_EACH_METHOD, so that adding a method to kj
+  // (which then travels as OTHER) doesn't break this test.
+#define FOR_EACH_CAPNP_METHOD(MACRO) \
+  MACRO(GET) MACRO(HEAD) MACRO(POST) MACRO(PUT) MACRO(DELETE) MACRO(PATCH) MACRO(PURGE) \
+  MACRO(OPTIONS) MACRO(TRACE) MACRO(COPY) MACRO(LOCK) MACRO(MKCOL) MACRO(MOVE) MACRO(PROPFIND) \
+  MACRO(PROPPATCH) MACRO(SEARCH) MACRO(UNLOCK) MACRO(ACL) MACRO(REPORT) MACRO(MKACTIVITY) \
+  MACRO(CHECKOUT) MACRO(MERGE) MACRO(MSEARCH) MACRO(NOTIFY) MACRO(SUBSCRIBE) MACRO(UNSUBSCRIBE) \
+  MACRO(QUERY) MACRO(BAN)
+#define EXPECT_ROUND_TRIP(METHOD) \
+  KJ_EXPECT(httpMethodToCapnp(kj::HttpMethod::METHOD) == capnp::HttpMethod::METHOD); \
+  KJ_EXPECT(httpMethodFromCapnp(capnp::HttpMethod::METHOD, nullptr) == kj::HttpMethod::METHOD);
 
-  KJ_HTTP_FOR_EACH_METHOD(EXPECT_MATCH);
-#undef EXPECT_MATCH
+  FOR_EACH_CAPNP_METHOD(EXPECT_ROUND_TRIP);
+#undef EXPECT_ROUND_TRIP
+#undef FOR_EACH_CAPNP_METHOD
+
+  KJ_EXPECT(httpMethodToCapnp("BLOCK"_kj) == capnp::HttpMethod::OTHER);
+  KJ_EXPECT(httpMethodFromCapnp(capnp::HttpMethod::OTHER, "BLOCK") == "BLOCK");
+
+  // A listed method sent as OTHER is the same method.
+  KJ_EXPECT(httpMethodFromCapnp(capnp::HttpMethod::OTHER, "GET") == kj::HttpMethod::GET);
+
+  KJ_EXPECT_THROW_MESSAGE("invalid HTTP method",
+      httpMethodFromCapnp(capnp::HttpMethod::OTHER, "BL OCK"));
+  KJ_EXPECT_THROW_MESSAGE("invalid HTTP method",
+      httpMethodFromCapnp(capnp::HttpMethod::OTHER, nullptr));
+  KJ_EXPECT_THROW_MESSAGE("invalid HTTP method",
+      httpMethodFromCapnp(capnp::HttpMethod::OTHER, "CONNECT"));
+
+  // There is no length limit...
+  auto longName = kj::str(kj::repeat('X', 100000));
+  KJ_EXPECT(httpMethodFromCapnp(capnp::HttpMethod::OTHER, longName) == longName);
+
+  // ...but a long invalid name from the peer isn't copied into the exception wholesale.
+  auto longInvalidName = kj::str(longName, " ");
+  KJ_IF_SOME(e, kj::runCatchingExceptions([&]() {
+    httpMethodFromCapnp(capnp::HttpMethod::OTHER, longInvalidName);
+  })) {
+    KJ_EXPECT(e.getDescription().size() < 200, e.getDescription().size());
+  } else {
+    KJ_FAIL_EXPECT("expected an exception");
+  }
+
+  // Bytes outside ASCII in a bad name are escaped, so they don't reach logs raw.
+  KJ_IF_SOME(e, kj::runCatchingExceptions([&]() {
+    httpMethodFromCapnp(capnp::HttpMethod::OTHER, "BL\xc3\xb6" "CK");
+  })) {
+    for (char c: e.getDescription()) {
+      KJ_EXPECT(static_cast<kj::byte>(c) < 0x80, e.getDescription());
+    }
+  } else {
+    KJ_FAIL_EXPECT("expected an exception");
+  }
+  KJ_EXPECT_THROW_MESSAGE("unknown method",
+      httpMethodFromCapnp(static_cast<capnp::HttpMethod>(100), nullptr));
+
+  capnp::MallocMessageBuilder message;
+  auto request = message.initRoot<capnp::HttpRequest>();
+  setHttpMethod(request, "BLOCK");
+  KJ_EXPECT(request.getMethod() == capnp::HttpMethod::OTHER);
+  KJ_EXPECT(request.getMethodName() == "BLOCK");
+  KJ_EXPECT(getHttpMethod(request.asReader()) == "BLOCK");
+
+  setHttpMethod(request, kj::HttpMethod::POST);
+  KJ_EXPECT(request.getMethod() == capnp::HttpMethod::POST);
+  KJ_EXPECT(!request.hasMethodName());
+  KJ_EXPECT(getHttpMethod(request.asReader()) == kj::HttpMethod::POST);
+
+  KJ_EXPECT_THROW_MESSAGE("invalid HTTP method", setHttpMethod(request, "BL OCK"));
 }
 
 // =======================================================================================
@@ -164,6 +227,48 @@ constexpr TestStep TEST_STEPS[] = {
     "Content-Length: 4\r\n"
     "\r\n"
     "nope"_kj
+  },
+
+  // A method not listed in KJ_HTTP_FOR_EACH_METHOD.
+  {
+    CLIENT_TO_SERVER,
+
+    "BLOCK /foo/bar HTTP/1.1\r\n"
+    "Content-Length: 5\r\n"
+    "Host: example.com\r\n"
+    "\r\n"
+    "corge"_kj,
+  },
+  {
+    SERVER_TO_CLIENT,
+
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Length: 3\r\n"
+    "\r\n"
+    "foo"_kj
+  },
+
+  // Such a method without a body. Like any method but GET and HEAD, the client sends an explicit
+  // Content-Length: 0.
+  {
+    CLIENT_TO_SERVER,
+
+    "GEOLOCATION /foo/bar HTTP/1.1\r\n"
+    "Host: example.com\r\n"
+    "\r\n"_kj,
+
+    "GEOLOCATION /foo/bar HTTP/1.1\r\n"
+    "Content-Length: 0\r\n"
+    "Host: example.com\r\n"
+    "\r\n"_kj,
+  },
+  {
+    SERVER_TO_CLIENT,
+
+    "HTTP/1.1 200 OK\r\n"
+    "Content-Length: 3\r\n"
+    "\r\n"
+    "foo"_kj
   },
 
   // HEAD request
@@ -553,7 +658,7 @@ public:
       : headerTable(headerTable), fulfiller(kj::mv(fulfiller)), done(kj::mv(done)) {}
 
   kj::Promise<void> request(
-      kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
+      kj::StringPtr method, kj::StringPtr url, const kj::HttpHeaders& headers,
       kj::AsyncInputStream& requestBody, Response& response) override {
     kj::HttpHeaders respHeaders(headerTable);
     respHeaders.addPtrPtr("X-Foo", "bar");
@@ -745,7 +850,7 @@ public:
   }
 
   kj::Promise<void> request(
-      kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
+      kj::StringPtr method, kj::StringPtr url, const kj::HttpHeaders& headers,
       kj::AsyncInputStream& requestBody, Response& response) override {
     called = true;
     return kj::NEVER_DONE;
@@ -794,7 +899,7 @@ public:
       : headerTable(headerTable) {}
 
   kj::Promise<void> request(
-      kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
+      kj::StringPtr method, kj::StringPtr url, const kj::HttpHeaders& headers,
       kj::AsyncInputStream& requestBody, kj::HttpService::Response& response) override {
     KJ_UNIMPLEMENTED("Regular HTTP requests are not implemented here.");
   }
@@ -819,7 +924,7 @@ public:
       : headerTable(headerTable) {}
 
   kj::Promise<void> request(
-      kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
+      kj::StringPtr method, kj::StringPtr url, const kj::HttpHeaders& headers,
       kj::AsyncInputStream& requestBody, kj::HttpService::Response& response) override {
     KJ_UNIMPLEMENTED("Regular HTTP requests are not implemented here.");
   }
@@ -856,7 +961,7 @@ public:
       : headerTable(headerTable) {}
 
   kj::Promise<void> request(
-      kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
+      kj::StringPtr method, kj::StringPtr url, const kj::HttpHeaders& headers,
       kj::AsyncInputStream& requestBody, kj::HttpService::Response& response) override {
     KJ_UNIMPLEMENTED("Regular HTTP requests are not implemented here.");
   }
@@ -1048,7 +1153,7 @@ KJ_TEST("HTTP-over-Cap'n-Proto Connect with startTls") {
 
     kj::Promise<WebSocketResponse> openWebSocket(
       kj::StringPtr url, const kj::HttpHeaders& headers) override { KJ_UNREACHABLE; }
-    Request request(kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
+    Request request(kj::StringPtr method, kj::StringPtr url, const kj::HttpHeaders& headers,
                   kj::Maybe<uint64_t> expectedBodySize = kj::none) override { KJ_UNREACHABLE; }
 
     ConnectRequest connect(kj::StringPtr host, const kj::HttpHeaders& headers,

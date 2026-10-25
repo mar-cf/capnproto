@@ -252,7 +252,7 @@ public:
         customHeaderId(headerTableBuilder.add("X-Custom-Header")) {}
 
   kj::Promise<void> request(
-      kj::HttpMethod method, kj::StringPtr url, const kj::HttpHeaders& headers,
+      kj::StringPtr method, kj::StringPtr url, const kj::HttpHeaders& headers,
       kj::AsyncInputStream& requestBody, Response& response) override {
     KJ_ASSERT(method == kj::HttpMethod::GET);
     KJ_ASSERT(url == "http://foo"_kj);
