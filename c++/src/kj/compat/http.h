@@ -117,6 +117,11 @@ bool isValidHttpMethod(kj::ArrayPtr<const char> name);
 // Whether `name` can be the method of an HTTP request: any token per RFC 9110, except "CONNECT",
 // which is handled separately (see HttpService::connect()). KJ checks every method it sends or
 // receives with this, so that a method can't break the request line, e.g. by containing a space.
+//
+// Method names are case-sensitive, but this also returns false for a name that differs from a
+// method listed in KJ_HTTP_FOR_EACH_METHOD or CONNECT only in case, such as "get" or "Head". A peer
+// that compares method names case-insensitively would disagree with us about what such a method
+// means -- e.g. whether the response to "head" has a body -- which could desynchronize a connection.
 
 void requireValidHttpMethod(kj::ArrayPtr<const char> name);
 // Throws if `isValidHttpMethod(name)` is false. The name may come from a peer, so the exception

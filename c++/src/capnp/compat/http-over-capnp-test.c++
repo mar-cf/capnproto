@@ -111,6 +111,8 @@ KJ_TEST("HTTP method conversion") {
       httpMethodFromCapnp(capnp::HttpMethod::OTHER, nullptr));
   KJ_EXPECT_THROW_MESSAGE("invalid HTTP method",
       httpMethodFromCapnp(capnp::HttpMethod::OTHER, "CONNECT"));
+  KJ_EXPECT_THROW_MESSAGE("invalid HTTP method",
+      httpMethodFromCapnp(capnp::HttpMethod::OTHER, "head"));
 
   // There is no length limit...
   auto longName = kj::str(kj::repeat('X', 100000));

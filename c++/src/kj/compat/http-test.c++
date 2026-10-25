@@ -97,9 +97,18 @@ KJ_TEST("isValidHttpMethod") {
   KJ_EXPECT(isValidHttpMethod("M-SEARCH"_kj));
   KJ_EXPECT(isValidHttpMethod("!#$%&'*+-.^_`|~09azAZ"_kj));
 
-  // Method names are case-sensitive: "get" is valid, and it's a different method than GET.
-  KJ_EXPECT(isValidHttpMethod("get"_kj));
-  KJ_EXPECT("get"_kj != HttpMethod::GET);
+  // Method names are case-sensitive, so "block" is valid, and a different method than "BLOCK"...
+  KJ_EXPECT(isValidHttpMethod("block"_kj));
+
+  // ...but a name that differs from a listed method or CONNECT only in case is invalid, rather than
+  // a different method that a case-insensitive peer would disagree with us about.
+  KJ_EXPECT(!isValidHttpMethod("get"_kj));
+  KJ_EXPECT(!isValidHttpMethod("Get"_kj));
+  KJ_EXPECT(!isValidHttpMethod("head"_kj));
+  KJ_EXPECT(!isValidHttpMethod("mSeArCh"_kj));
+  KJ_EXPECT(!isValidHttpMethod("connect"_kj));
+  KJ_EXPECT(!isValidHttpMethod("Connect"_kj));
+  KJ_EXPECT(isValidHttpMethod("gets"_kj));
 
   // There is no length limit.
   KJ_EXPECT(isValidHttpMethod(kj::str(kj::repeat('X', 1000))));
@@ -412,10 +421,13 @@ KJ_TEST("HttpHeaders parse requests with methods not in KJ_HTTP_FOR_EACH_METHOD"
     KJ_EXPECT(request.authority == "example.com:443");
   }
 
-  // Methods that aren't valid tokens are still rejected.
+  // Methods that aren't valid tokens, or that differ from a listed method or CONNECT only in case,
+  // are still rejected.
   for (auto text: {"BL/OCK /foo HTTP/1.1\r\n\r\n"_kj,
                    "BL\x80OCK /foo HTTP/1.1\r\n\r\n"_kj,
-                   " /foo HTTP/1.1\r\n\r\n"_kj}) {
+                   " /foo HTTP/1.1\r\n\r\n"_kj,
+                   "head /foo HTTP/1.1\r\n\r\n"_kj,
+                   "connect example.com:443 HTTP/1.1\r\n\r\n"_kj}) {
     KJ_CONTEXT(text);
     HttpHeaders headers(*table);
     auto input = kj::heapString(text);
@@ -1942,7 +1954,7 @@ KJ_TEST("HttpClient refuses invalid methods") {
   HttpHeaderTable table;
 
   auto client = newHttpClient(table, *pipe.ends[0]);
-  for (auto method: {"GE T"_kj, "GET\r\nHost: evil"_kj, "CONNECT"_kj, ""_kj}) {
+  for (auto method: {"GE T"_kj, "GET\r\nHost: evil"_kj, "CONNECT"_kj, ""_kj, "get"_kj}) {
     KJ_CONTEXT(method);
     KJ_EXPECT_THROW_MESSAGE("invalid HTTP method",
         client->request(method, "/", HttpHeaders(table)));
@@ -1956,9 +1968,9 @@ KJ_TEST("HttpClient refuses invalid methods") {
   KJ_EXPECT(service.methods.size() == 0);
 }
 
-KJ_TEST("HttpServer gives a response body to every method but exactly HEAD") {
-  // Method names are case-sensitive, so "head" is a different method than HEAD, and the response to
-  // it has a body like any other.
+KJ_TEST("HttpServer rejects a method that differs from a listed method only in case") {
+  // E.g. "head" must not reach the service as a method whose response has a body: a
+  // case-insensitive peer would treat it as HEAD and expect no body.
 
   KJ_HTTP_TEST_SETUP_IO;
   kj::TimerImpl timer(kj::origin<kj::TimePoint>());
@@ -1973,20 +1985,17 @@ KJ_TEST("HttpServer gives a response body to every method but exactly HEAD") {
 
   pipe.ends[1]->write(
       "head /foo HTTP/1.1\r\n"
-      "\r\n"
-      "HEAD /foo HTTP/1.1\r\n"
       "\r\n"_kjb).wait(waitScope);
   expectRead(*pipe.ends[1],
-      "HTTP/1.1 200 OK\r\n"
-      "Content-Length: 3\r\n"
+      "HTTP/1.1 501 Not Implemented\r\n"
+      "Connection: close\r\n"
+      "Content-Length: 35\r\n"
+      "Content-Type: text/plain\r\n"
       "\r\n"
-      "foo"
-      "HTTP/1.1 200 OK\r\n"
-      "Content-Length: 3\r\n"
-      "\r\n"_kj).wait(waitScope);
+      "ERROR: Unrecognized request method."_kj).wait(waitScope);
 
-  pipe.ends[1]->shutdownWrite();
   listenTask.wait(waitScope);
+  KJ_EXPECT(service.methods.size() == 0);
 }
 
 KJ_TEST("HttpServer responses") {

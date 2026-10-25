@@ -457,12 +457,36 @@ kj::Maybe<kj::OneOf<kj::StringPtr, HttpConnectMethod>> tryParseHttpMethodAllowin
   }
 }
 
+static constexpr kj::StringPtr LISTED_METHODS[] = {
+#define METHOD(id) HttpMethod::id,
+KJ_HTTP_FOR_EACH_METHOD(METHOD)
+#undef METHOD
+};
+
+static bool equalsIgnoringCase(kj::ArrayPtr<const char> name, kj::StringPtr upper) {
+  // Whether `name` is `upper`, which is all uppercase, apart from the case of ASCII letters.
+
+  if (name.size() != upper.size()) return false;
+  for (auto i: kj::indices(name)) {
+    char c = name[i];
+    if ('a' <= c && c <= 'z') c = c - 'a' + 'A';
+    if (c != upper[i]) return false;
+  }
+  return true;
+}
+
 bool isValidHttpMethod(kj::ArrayPtr<const char> name) {
   if (name.size() == 0) return false;
   for (char c: name) {
     if (!HTTP_METHOD_CHARS.contains(c)) return false;
   }
-  return name != "CONNECT"_kj;
+
+  // Reject names that differ from a listed method or CONNECT only in case, such as "head". See the
+  // comment on the declaration for why.
+  for (auto listed: LISTED_METHODS) {
+    if (equalsIgnoringCase(name, listed)) return name == listed;
+  }
+  return !equalsIgnoringCase(name, "CONNECT"_kj);
 }
 
 void requireValidHttpMethod(kj::ArrayPtr<const char> name) {
