@@ -5752,7 +5752,10 @@ public:
 
   Request request(HttpMethod method, kj::StringPtr url, const HttpHeaders& headers,
                   kj::Maybe<uint64_t> expectedBodySize = kj::none) override {
-    KJ_REQUIRE(method != HttpMethod::CONNECT, "use connect() for CONNECT requests");
+    if (method == HttpMethod::CONNECT) {
+      return requestViaConnect(*this, url, headers);
+    }
+
     KJ_REQUIRE(!upgraded,
         "can't make further requests on this HttpClient because it has been or is in the process "
         "of being upgraded");
@@ -6155,6 +6158,65 @@ kj::Promise<HttpClient::WebSocketResponse> HttpClient::openWebSocket(
 HttpClient::ConnectRequest HttpClient::connect(
     kj::StringPtr host, const HttpHeaders& headers, HttpConnectSettings settings) {
   KJ_UNIMPLEMENTED("CONNECT is not implemented by this HttpClient");
+}
+
+namespace {
+
+class TunnelWriteEnd final: public kj::AsyncOutputStream {
+  // Writes into a CONNECT tunnel, and shuts down the tunnel's write side when dropped.
+public:
+  TunnelWriteEnd(kj::Rc<kj::AsyncIoStream> tunnel): tunnel(kj::mv(tunnel)) {}
+  ~TunnelWriteEnd() noexcept(false) {
+    unwind.catchExceptionsIfUnwinding([&]() {
+      tunnel->shutdownWrite();
+    });
+  }
+
+  kj::Promise<void> write(kj::ArrayPtr<const byte> buffer) override {
+    return tunnel->write(buffer);
+  }
+
+  kj::Promise<void> write(kj::ArrayPtr<const kj::ArrayPtr<const byte>> pieces) override {
+    return tunnel->write(pieces);
+  }
+
+  kj::Maybe<kj::Promise<uint64_t>> tryPumpFrom(
+      kj::AsyncInputStream& input, uint64_t amount) override {
+    return tunnel->tryPumpFrom(input, amount);
+  }
+
+  kj::Promise<void> whenWriteDisconnected() override {
+    return tunnel->whenWriteDisconnected();
+  }
+
+private:
+  kj::Rc<kj::AsyncIoStream> tunnel;
+  kj::UnwindDetector unwind;
+};
+
+}  // namespace
+
+HttpClient::Request requestViaConnect(
+    HttpClient& client, kj::StringPtr authority, const HttpHeaders& headers) {
+  auto request = client.connect(authority, headers, {});
+  kj::Rc<kj::AsyncIoStream> tunnel(kj::mv(request.connection));
+
+  auto response = request.status.then(
+      [tunnel = tunnel.addRef()](HttpClient::ConnectRequest::Status&& status) mutable {
+    kj::Own<kj::AsyncInputStream> body;
+    if (status.statusCode >= 200 && status.statusCode < 300) {
+      body = tunnel.toOwn();
+    } else KJ_IF_SOME(errorBody, status.errorBody) {
+      // The error body may read from the same connection.
+      body = errorBody.attach(kj::mv(tunnel));
+    } else {
+      body = kj::heap<kj::NullStream>();
+    }
+    return HttpClient::Response(
+        status.statusCode, kj::mv(status.statusText), kj::mv(status.headers), kj::mv(body));
+  });
+
+  return { kj::heap<TunnelWriteEnd>(kj::mv(tunnel)), kj::mv(response) };
 }
 
 kj::Own<HttpClient> newHttpClient(
@@ -6723,6 +6785,10 @@ public:
 
   Request request(HttpMethod method, kj::StringPtr url, const HttpHeaders& headers,
                   kj::Maybe<uint64_t> expectedBodySize = kj::none) override {
+    if (method == HttpMethod::CONNECT) {
+      return requestViaConnect(*this, url, headers);
+    }
+
     // We need to parse the proxy-style URL to convert it to host-style.
     // Use URL parsing options that avoid unnecessary rewrites.
     Url::Options urlOptions;
@@ -7196,6 +7262,10 @@ public:
 
   Request request(HttpMethod method, kj::StringPtr url, const HttpHeaders& headers,
                   kj::Maybe<uint64_t> expectedBodySize = kj::none) override {
+    if (method == HttpMethod::CONNECT) {
+      return requestViaConnect(*this, url, headers);
+    }
+
     // We have to clone the URL and headers because HttpService implementation are allowed to
     // assume that they remain valid until the service handler completes whereas HttpClient callers
     // are allowed to destroy them immediately after the call.

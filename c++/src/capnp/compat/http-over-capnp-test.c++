@@ -1168,5 +1168,32 @@ KJ_TEST("HTTP-over-Cap'n-Proto Connect reports the outcome of startTls") {
   listenTask.wait(waitScope);
 }
 
+KJ_TEST("HTTP-over-Cap'n-Proto client request() with CONNECT reaches the remote connect()") {
+  kj::EventLoop eventLoop;
+  kj::WaitScope waitScope(eventLoop);
+
+  ByteStreamFactory streamFactory;
+  kj::HttpHeaderTable::Builder tableBuilder;
+  HttpOverCapnpFactory factory(streamFactory, tableBuilder, TEST_PEER_OPTIMIZATION_LEVEL);
+  kj::Own<kj::HttpHeaderTable> table = tableBuilder.build();
+  auto frontService = factory.capnpToKj(
+      factory.kjToCapnp(kj::heap<ConnectWriteRespService>(*table)));
+  auto client = kj::newHttpClient(*frontService);
+
+  auto request = client->request(
+      kj::HttpMethod::CONNECT, "example.org:443", kj::HttpHeaders(*table));
+  auto response = request.response.wait(waitScope);
+  KJ_EXPECT(response.statusCode == 200);
+  KJ_EXPECT(response.statusText == "OK");
+
+  auto promises = kj::heapArrayBuilder<kj::Promise<void>>(2);
+  promises.add(request.body->write("hello"_kjb));
+  promises.add(expectRead(*response.body, "hello"));
+  kj::joinPromises(promises.finish()).wait(waitScope);
+
+  request.body = nullptr;
+  expectEnd(*response.body).wait(waitScope);
+}
+
 }  // namespace
 }  // namespace capnp

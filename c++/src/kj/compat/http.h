@@ -873,6 +873,9 @@ public:
   // `expectedBodySize`, if provided, must be exactly the number of bytes that will be written to
   // the body. This will trigger use of the `Content-Length` connection header. Otherwise,
   // `Transfer-Encoding: chunked` will be used.
+  //
+  // If `method` is CONNECT, `url` is the authority (e.g. "example.org:443") and the request is
+  // served by `connect()`, as described at `requestViaConnect()`.
 
   struct WebSocketResponse {
     WebSocketResponse(uint statusCode, kj::StringPtr statusText, const HttpHeaders* headers,
@@ -1008,6 +1011,8 @@ public:
       HttpMethod method, kj::StringPtr url, const HttpHeaders& headers,
       kj::AsyncInputStream& requestBody, Response& response) = 0;
   // Perform an HTTP request.
+  //
+  // `method` is never CONNECT. CONNECT requests are passed to `connect()`.
   //
   // `url` may be a full URL (with protocol and host) or it may be only the path part of the URL,
   // depending on whether the service is a proxy service or a host service.
@@ -1199,6 +1204,12 @@ kj::Own<HttpClient> newConcurrencyLimitingHttpClient(
 kj::Own<HttpClient> newHttpClient(HttpService& service);
 kj::Own<HttpService> newHttpService(HttpClient& client);
 // Adapts an HttpClient to an HttpService and vice versa.
+
+HttpClient::Request requestViaConnect(
+    HttpClient& client, kj::StringPtr authority, const HttpHeaders& headers);
+// Serves `client.request(HttpMethod::CONNECT, authority, headers)` with `client.connect()`. The
+// request body writes into the tunnel, and dropping it shuts down the tunnel's write side. A 2xx
+// response's body reads from the tunnel. Any other response's body is the rejection's body.
 
 kj::Own<HttpInputStream> newHttpInputStream(
     kj::AsyncInputStream& input, const HttpHeaderTable& headerTable);

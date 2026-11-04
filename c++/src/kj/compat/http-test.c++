@@ -8565,15 +8565,53 @@ KJ_TEST("HttpServer can suspend and resume a CONNECT request") {
   KJ_EXPECT(echoService.connectCount == 1);
 }
 
-KJ_TEST("HttpClient refuses CONNECT in request()") {
+void testRequestOpensTunnel(kj::WaitScope& waitScope, HttpClient& client, HttpHeaderTable& table) {
+  // Opens a tunnel to a ConnectEchoService with request(CONNECT, ...).
+  auto request = client.request(HttpMethod::CONNECT, "example.org:443", HttpHeaders(table));
+  auto response = request.response.wait(waitScope);
+  KJ_EXPECT(response.statusCode == 200);
+  KJ_EXPECT(response.statusText == "OK");
+
+  auto promises = kj::heapArrayBuilder<kj::Promise<void>>(2);
+  promises.add(request.body->write("hello"_kjb));
+  promises.add(expectRead(*response.body, "hello"_kj));
+  kj::joinPromises(promises.finish()).wait(waitScope);
+
+  // Dropping the request body shuts down the tunnel's write side, which ends the echo.
+  request.body = nullptr;
+  expectEnd(*response.body).wait(waitScope);
+}
+
+KJ_TEST("HttpClient serves request() with CONNECT over HTTP/1 with connect()") {
   KJ_HTTP_TEST_SETUP_IO;
+
   auto pipe = KJ_HTTP_TEST_CREATE_2PIPE;
 
-  HttpHeaderTable table;
-  auto client = newHttpClient(table, *pipe.ends[0]);
+  kj::TimerImpl timer(kj::origin<kj::TimePoint>());
 
-  KJ_EXPECT_THROW_MESSAGE("use connect() for CONNECT requests",
-      client->request(HttpMethod::CONNECT, "example.org:443", HttpHeaders(table)));
+  HttpHeaderTable table;
+  ConnectEchoService service(table);
+  HttpServer server(timer, table, service);
+
+  auto listenTask = server.listenHttp(kj::mv(pipe.ends[0]));
+
+  auto client = newHttpClient(table, *pipe.ends[1]);
+  testRequestOpensTunnel(waitScope, *client, table);
+
+  listenTask.wait(waitScope);
+
+  KJ_EXPECT(service.connectCount == 1);
+}
+
+KJ_TEST("newHttpClient(HttpService&) serves request() with CONNECT with service.connect()") {
+  KJ_HTTP_TEST_SETUP_IO;
+
+  HttpHeaderTable table;
+  ConnectEchoService service(table);
+  auto client = newHttpClient(service);
+  testRequestOpensTunnel(waitScope, *client, table);
+
+  KJ_EXPECT(service.connectCount == 1);
 }
 
 struct HttpRangeTestCase {
